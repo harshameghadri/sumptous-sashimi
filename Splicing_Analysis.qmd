@@ -1,0 +1,847 @@
+---
+title: "Analysis of splicing variants using R"
+author: "Sri Harsha Meghadri"
+format: 
+  html:
+    toc: true
+    toc-depth: 4
+    code-fold: show
+    code-link: true
+    code-summary: "Show the code"
+    page-layout: full
+    fig-align: default
+    fig-width: 8
+    fig-height: 7
+    embed-resources: true
+    output-file: "Splicing Analysis Test report"
+    theme:
+      dark: superhero
+      light: superhero
+code-line-numbers: true
+execute: 
+  echo: fenced
+  freeze: auto
+knitr:
+  opts_chunk: 
+    collapse: true
+editor: visual
+---
+
+## Package Installations {#sec-package-installations}
+
+This section will install a lot of libraries required for general bioinformatics analysis in R.
+
+### Create a function to install multiple packages
+
+comment it in by removing \#
+
+```{r}
+#ipak <- function(pkg){
+#    new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+#    if (length(new.pkg)) 
+#        install.packages(new.pkg, dependencies = TRUE)
+#    sapply(pkg, require, character.only = TRUE)
+#}
+```
+
+```{r}
+#ipak(c("boot", "cluster", "codetools", "foreign", "KernSmooth", "lattice", "MASS", "Matrix", ""))
+```
+
+```{r}
+#bio_pkgs <- c("ggbio","biomaRt", "EnsDb.Hsapiens.v75", "renvcBioPortalData", 
+#          "GenomicRanges", "GenomicFeatures", "TxDb.Hsapiens.UCSC.hg19.knownGene", "Homo.sapiens", "AnnotationDbi", "edgeR", "DESeq2", "FRASER", "SplicingGraphs", "SeqGSEA", "SpliceWiz")
+#BiocManager::install(bio_pkgs)
+```
+
+```{r}
+library(knitr)
+library(data.table)
+render_tidy_table <- function(data) {
+  kable(data, options = list(
+    width = '100%',
+    align = 'c',
+    style = 'striped',
+    row.names = TRUE,
+    header.style = list(
+      background = '#fff',
+      color = '#000'
+    ),
+    body.style = list(
+      background = '#fff',
+      color = '#000'
+    )
+  ))
+}
+
+# Function to format tibble data frame
+format_tibble <- function(tibble, caption = "", col_widths = NULL) {
+  # Set default column widths if not provided
+  if (is.null(col_widths)) {
+    col_widths = rep('auto', ncol(tibble))
+  }
+
+  # Convert tibble to HTML table with formatting
+  kable(tibble, options = list(
+    caption = caption,
+    col.widths = col_widths,
+    rowZebra = TRUE,
+    align = 'c'
+  )) %>%
+    kableExtra::html_row(1, html = paste0('<b>', caption, '</b>'))
+}
+```
+
+------------------------------------------------------------------------
+
+## Analysis tutorial using FRASER
+
+The idea here is to run the tutorial with the working example that is given in this \[link\](<https://colab.research.google.com/drive/1OKT32eNIq7Cz839jjqz-GJlvoToPYbib>). This will be then adjusted and run in a new notebook for the DMT1 analysis.
+
+```{r}
+# Add the directory where installed libs are stored
+.libPaths( c( .libPaths(), "/home/ngadmin/development/R_libraries/") )
+```
+
+```{r}
+# download required files 
+download.file(destfile="r-env-setup-script.R", 
+    url="https://raw.githubusercontent.com/c-mertes/RNAseq-ASHG19/master/r-env-setup-script.R")
+source("r-env-setup-script.R")
+print("Setup done.")
+```
+
+```{r}
+library(OUTRIDER)
+library(annotables)
+library(data.table)
+library(ggplot2)
+library(ggpubr)
+library(shiny)
+library(knitr)
+library(tictoc)
+```
+
+#### 
+
+Using the raw read counts and a sample annnotation we can find the gene expression outliers
+
+```{r}
+#| column: screen-inset
+#| layout-nrow: 1
+anno <- fread("./annotation.tsv")[, 1:6]
+cts <- as.matrix(read.table("./outrider/raw_counts.tsv.gz"))
+
+#sneak peak into the data
+render_tidy_table(head(anno))
+print("Dimensions of the annotation:")
+dim(anno)
+
+cts[1:5, 1:10]
+print("Dimensions of the count table:")
+dim(cts)
+```
+
+Create an Outrider object with the loaded annotation and raw count matrix
+
+```{r}
+anno[,sampleID:=INDIVIDUAL]
+ods <- OutriderDataSet(countData = cts, colData = anno)
+ods
+```
+
+### QC and preprocessing of raw count data.
+
+#### Size Factor
+
+It represents the sequencing depth of each sample with respect to the others and is centered around 1. we can use `estimateSizeFactors` from DESeq2 and plot it.
+
+Things to consider:
+
+1.  A low *sizeFactor* could be an indication for a failed experiment or issues with RNA preperation
+
+```{r}
+#| column: screen-inset
+#| layout-nrow: 1
+ods <- estimateSizeFactors(ods)
+plotSizeFactors(ods)
+```
+
+##### Identify the sample with lowest *sizefactor*
+
+```{r}
+round(sort(sizeFactors(ods)), digits = 2)[1:5]
+```
+
+#### Filtering non-expressed genes
+
+-   It is done to reove genes that are not expressed or/and of low quality.
+
+-   to detect outliers removing non expressed genes gives a more robust result
+
+-   As a good starting point keep genes where at least 5% of the samples have FPKM value greater than 1 (FPKM: Fragments per kilobase of transcript per million mapped reads)
+
+```{r}
+txdb <- loadDb("annotations/gencode.v29lift37.annotation.txdb")
+ods <- filterExpression(ods, gtfFile=txdb, filterGenes=FALSE)
+```
+
+-   Plot the number of genes filtered out and their expression distributions across sample/gene pairs
+
+```{r}
+#| column: screen-inset
+#| layout-nrow: 1
+plotFPKM(ods) + theme(legend.position = 'bottom')
+```
+
+```{r}
+# filter object based on the expression status of the genes
+ods <- ods[mcols(ods)[, "passedFilter"],]
+ods
+```
+
+### Sample co-variation
+
+```{r}
+options(repr.plot.height = 5, repr.plot.width = 6)
+
+# we will use normalize=FALSE since we have not corrected the data yet and cols from the #annotation to add labels to the heatmap
+plotCountCorHeatmap(ods, colGroups=c("SEX", "ORIGIN"), rowGroups= "LAB", normalize= FALSE)
+```
+
+### Model Fitting {#sec-model-fitting}
+
+Using OUTRIDER to model sample co-variation. this is based on an autoencoder framework
+
+```{r}
+tic()
+register(MulticoreParam(workers = 4, tasks = 12, progressbar = TRUE))
+ods <- readRDS("outrider/fitted_ods.RDS")
+#ods <- findEncodingDim(ods)
+getBestQ(ods)
+toc()
+#ods <- OUTRIDER(ods, q=getBestQ(ods))
+
+```
+
+```{r}
+plotEncDimSearch(ods)
+```
+
+```{r}
+# Check the heatmap
+plotCountCorHeatmap(ods, colGroups=c("SEX", "ORIGIN"), rowGroups="LAB", normalize=TRUE)
+```
+
+### Detection of Expression outliers {#sec-detection-of-expression-outliers}
+
+Outlier: An event that significantly deviates from the expected Negative-Bionomical distribution after controlling for confounders.
+
+```{r}
+plotAberrantPerSample(ods)
+```
+
+#### What are the genes that are outliers.
+
+```{r}
+geneIDs <- gsub("\\.[0-9]*(_[0-9]*)?.*$", "", rownames(ods))
+map <- merge(data.table(ensgene=geneIDs), grch37, sort=FALSE, all.x=TRUE)[!duplicated(ensgene),]
+
+# Set new gene names only if hgnc symbol is present
+if(!"ENSG" %in% colnames(mcols(ods))){
+  mcols(ods)$ENSG <- geneIDs
+  rownames(ods) <- map[,ifelse(
+    is.na(symbol) | symbol == "" | duplicated(symbol), geneIDs, symbol)]
+}
+```
+
+Lets retrivve the expression outliers
+
+```{r}
+res <- results(ods)
+render_tidy_table(head(res))
+dim(res)
+```
+
+### Finding candidates in a patient.
+
+As per the tutorial, sample NA18873 has a rare mitochondrial disease with complex 1 deficiency. This means we need to find MT genes abberently expressed.
+
+```{r}
+plotVolcano(ods, "NA18873", base=TRUE)
+```
+
+```{r}
+render_tidy_table(res[sampleID == "NA18873"])
+```
+
+```{r}
+options(repr.plot.width=8, repr.plot.height=4)
+
+ggarrange(ncol=2,
+    plotExpressionRank(ods, "TIMMDC1", norm=FALSE, basePlot=TRUE) + scale_y_log10(lim=c(300,2000)),
+    plotExpressionRank(ods, "TIMMDC1", norm=TRUE,  basePlot=TRUE) + scale_y_log10(lim=c(300,2000)))
+```
+
+# Aberrant Splicing Detection in RNA-Seq Data.
+
+A comprehensive background on Splicing and how FRASER works is available at <https://docs.google.com/presentation/d/1a7KZ6FXwVmGqF-FMAnz0QTk07WgzRWAbFhSNrUBspIQ/edit?pli=1#slide=id.g64b01c344e_4_394>
+
+Here we will focus on loading the packages and executing the tutorial.
+
+```{r}
+library(FRASER)
+library(data.table)
+library(ggplot2)
+library(ggpubr)
+register(SerialParam())
+```
+
+```{r}
+anno_fras <- fread("annotation.tsv")[,1:6]
+anno_fras[, sampleID:=INDIVIDUAL]
+junctionCts <- fread("./splicing/raw_junction_counts.tsv.gz")
+spliceSiteCts <- fread("./splicing/raw_site_counts.tsv.gz")
+```
+
+```{r}
+render_tidy_table(head(anno_fras))
+render_tidy_table(junctionCts[1:6, 1:15])
+render_tidy_table(spliceSiteCts[1:6, 1:15])
+```
+
+```{r}
+# Create a FRASER object
+
+fds <- FraserDataSet(colData = anno_fras, junctions = junctionCts, spliceSites = spliceSiteCts)
+
+fds
+```
+
+Creating a subset of data consisting 3 patients and 3 chromosomes only for splicing analysis
+
+```{r}
+set.seed(42)
+patient_ids <- c("NA11918", "NA20505", "HG00132")
+fds <- fds <- fds[
+    seqnames(fds) %in% c("chr3", "chr6", "chr19"),
+    unique(c(patient_ids, sample(colnames(fds))))[1:60]]
+dontWriteHDF5(fds) <- TRUE
+fds
+```
+
+### Filtering of data.
+
+1.  Calculate the splicing metric with Percent Spliced In (PSI) and Splicing efficiency.
+2.  Create filters such as min reads required per sample or the % of the samples having x reads at the least.
+3.  At least one sample has to have \|Δ𝜓\|\>0.1
+
+```{r, echo=FALSE, results='hide'}
+
+fds <- calculatePSIValues(fds)
+fds <- filterExpressionAndVariability(fds, minDeltaPsi = 0.1, filter = FALSE)
+```
+
+```{r}
+options(repr.plot.width = 5, repr.plot.height = 4)
+
+pfe1 <- plotFilterExpression(fds, bins=100)
+pfe2 <- plotFilterVariability(fds) + theme(legend.position = "none")
+ggarrange(pfe1, pfe2, ncol = 2)
+```
+
+```{r}
+fds <- fds[mcols(fds, type= "j")[,"passed"],]
+fds
+```
+
+-   have a look into our data to see if we do have correlation structure or not. To have a better estimate, we use the logit transformed 𝜓 values to compute the correlation. We can annotate our plot with any information provided through the sample annotation.
+
+```{r}
+options(repr.plot.height = 5, repr.plot.width = 6)
+
+plotCountCorHeatmap(fds, type= "psi5", logit=TRUE, sampleClustering=NA, annotation_cols=c("SEX", "LAB", "ORIGIN"))
+```
+
+Here I am training the model from scratch to see if this can be performed in the server (time consuming so you can skip if the model has already been stored)
+
+```{r}
+#register(MulticoreParam(workers = 4, tasks = 20, progressbar = TRUE))
+#tic(msg = "Starting the loop")
+#for(i in psiTypes) {
+#  fds <- optimHyperParams(fds, i)
+#  bestQ(fds,i)
+#  plotEncDimSearch(fds, i)
+#}
+#toc(log = TRUE)
+```
+
+```{r}
+#fds <- FRASER(fds) # uncommented because i have loaded fds from ./splicing/fitted_fds.RDS
+fds <- readRDS("splicing/fitted_fds.RDS")
+```
+
+```{r}
+plotCountCorHeatmap(fds, type="psi5", normalized=TRUE, logit=TRUE,
+                    topN=15000, annotation_col=c("SEX", "LAB", "ORIGIN"), sampleClustering=NA)
+```
+
+```{r}
+plotAberrantPerSample(fds)
+```
+
+```{r}
+fds <- annotateRangesWithTxDb(fds)
+
+register(SerialParam())
+res <- as.data.table(results(fds))
+res
+```
+
+```{r}
+resAsGR <- makeGRangesFromDataFrame(res, keep.extra.columns = TRUE)
+
+# group results by genes/sample
+results_by_genes <- as.data.table(resultsByGenes(resAsGR))
+results_by_genes
+```
+
+```{r}
+options(repr.plot.width = 4, repr.plot.height = 4)
+plotVolcano(fds, type="psi5", "NA11918")
+```
+
+Identifying splicing events in detail
+
+```{r}
+res[sampleID == "NA11918"]
+```
+
+```{r}
+plotExpression(fds, type="psi5", result=res[sampleID == "NA11918" & hgncSymbol == "TIMMDC1"][1])
+```
+
+diagnosis, we want to make sure that our call is correct. Hence, we want to look at many metric to boost our confident into the call. Let's make a publication ready figure (except the sashimi plot
+
+```{r}
+# Make the plotting area t fit 4 panels
+options(repr.plot.height = 4, repr.plot.width = 9)
+
+res2plot <- res[sampleID == "NA11918" & hgncSymbol == "TIMMDC1"][1,]
+ggarrange(ncol = 2, 
+          plotVolcano(fds, type= "psi5", "NA11918"),
+          plotExpression(fds, result = res2plot),
+          plotQQ(fds, result=res2plot),
+          plotExpectedVsObservedPsi(fds, result = res2plot))
+```
+
+## Mono Allelic expression
+
+```{r}
+#BiocManager::install("GenomicScores")
+#remotes::install_github("gagneurlab/tMAE")
+```
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(tMAE)
+```
+
+```{r}
+allelicCountsFile <- 'https://i12g-gagneurweb.in.tum.de/public/workshops/RNAseq_ASHG19/input_data/mae/allelic_counts.tsv.gz'
+allelicCounts <- fread(allelicCountsFile)
+
+# print data
+allelicCounts[1:4,]
+dim(allelicCounts)
+```
+
+```{r}
+print('IDs in table')
+unique(allelicCounts$MAE_ID)
+```
+
+Plot counts of alternative vs reference allele.
+
+```{r}
+ggplot(allelicCounts, aes(refCount+1, altCount+1)) + geom_point() + geom_abline(slope = 1, intercept = 0) + scale_y_log10() +scale_x_log10() + theme_bw()
+```
+
+### Run MAE test
+
+```{r}
+resMAE <- DESeq4MAE(allelicCounts, minCoverage = 10)
+head(resMAE)
+```
+
+#### Determine the number of mono-allelic events
+
+```{r}
+# define significance of the event to be expressed as padj < 0.05
+
+resMAE[, signif := padj < 0.05]
+
+# get number of cases
+print('MAE significant variants')
+resMAE[signif == TRUE, .N, by = MAE_ID]
+```
+
+```{r}
+# Add column for significant mono-allelic expression of the alternative
+resMAE[, signif_ALT := signif == TRUE & altRatio >= 0.8]
+
+# Get number of cases
+print('MAE for the alternative significant variants')
+resMAE[signif_ALT == TRUE, .N, by = MAE_ID]
+```
+
+```{r}
+## If your data is based on assembly 
+#BiocManager::install("MafDb.gnomAD.r2.1.hs37d5") #comment out after install
+library(MafDb.gnomAD.r2.1.hs37d5)
+mafdb <- MafDb.gnomAD.r2.1.hs37d5
+
+## If your data is based on assembly hg38
+#library(MafDb.gnomAD.r2.1.GRCh38)
+#mafdb <- MafDb.gnomAD.r2.1.GRCh38
+
+# convert results table into GRanges object
+#rng <- GRanges(seqnames = data$contig, 
+#               ranges = IRanges(start = data$position, end = data$position), 
+#               strand = '*')
+#resMAE$gnomadAF <- gscores(mafdb, rng)$AF
+
+```
+
+```{r}
+#Merge results with the annotation object
+resAnnot <- fread('https://i12g-gagneurweb.in.tum.de/public/workshops/RNAseq_ASHG19/input_data/mae/mae_annotated_results.tsv.gz')
+
+resAnnot[, rare := (gnomadAF <= 0.01 | is.na(gnomadAF))]
+print('Number of rare events in total (including non significant variants)')
+resAnnot[rare == TRUE, .N]
+```
+
+What are the rare mono-allelic events of these samples
+
+```{r}
+resAnnot[signif_ALT == TRUE & rare == TRUE]
+```
+
+Visualization using *plotAllelicCounts*
+
+```{r}
+sample1 <- 'HG00106'
+plotAllelicCounts(resAnnot[MAE_ID == sample1], rare_column = 'rare', title = sample1) + theme(legend.position = "bottom")
+  
+```
+
+```{r}
+sample2 <- 'HG00111'
+plotAllelicCounts(resAnnot[MAE_ID == sample2], rare_column = 'rare', title = sample2) + theme(legend.position = "bottom")
+```
+
+## Gene Prioritization
+
+```{r}
+
+# ensembleVEP requires variant_effect_predictor.pl in the PATH. For this you will likely have to manually install commandline version of https://www.ensembl.org/info/docs/tools/vep/script/vep_download.html
+# Also, the manuall install threw requirement of DBI as a perl package --> instal cpanminus using apt-get install followed by cpanm DBI
+library(VariantAnnotation)
+library(TVTB)
+library(annotables)
+library(ensemblVEP)
+library(tidyverse)
+library(data.table)
+```
+
+#### CASE 1
+
+This boy was the third child of healthy non-consanguineous French parents. Pregnancy and delivery were uneventful. Early psychomotor development was normal. However, speech development was delayed, acquiring language at the age of 4. At 11, he began to experience psychomotor regression and progressive visual loss. At current (by the time of the publication) age of 47, he has severe walking difficulties, blindness, abnormal behaviour (easily frightened, sometimes aggressive) and spontaneous speech.
+
+In our dataset, this sample is named **NA11918**.
+
+```{r}
+# Download a list of candidates
+results_link="https://i12g-gagneurweb.in.tum.de/public/workshops/RNAseq_ASHG19/input_data/outrider/results_pvalue.tsv.gz"
+outrider_results_genes=fread(results_link)
+
+# Filter for the case of interest
+outrider_results_genes= outrider_results_genes %>% filter(sampleID=="NA11918") %>% select(geneID) %>% unlist
+
+# Take a look at what the gene list looks like
+head(outrider_results_genes)
+# Get the number of candidate genes for that case
+print("The total number of candidate genes within this case:")
+length(outrider_results_genes)
+```
+
+GeneIDs here are not totally in ENSEMBL format so we will have to convert to one
+
+```{r}
+# Modify gene format
+outrider_results_genes=str_extract(outrider_results_genes, "ENSG[0-9]+")
+
+# look at the changes
+head(outrider_results_genes)
+```
+
+To make it human readable gene names. we will use annotable package and filter them
+
+```{r}
+candidate_genes=grch37 %>% filter(ensgene %in% outrider_results_genes)
+
+# look at the results
+head(candidate_genes)
+```
+
+We now have the list of candidate genes and more information on what they are. We are ready to filter this list to keep only the genes that are linked to the symptoms of the case of interest.
+
+In our case, the symptoms are:
+
+-   Developmental regression ([HP:0002376](https://hpo.jax.org/app/browse/term/HP:0002376))
+
+-   Ataxia([HP:0001251](https://hpo.jax.org/app/browse/term/HP:0001251))
+
+-   Ophthalmoplegia ([HP:0000602](https://hpo.jax.org/app/browse/term/HP:0000602))
+
+-   Visual impairment ([HP:0000505](https://hpo.jax.org/app/browse/term/HP:0000505))
+
+As you can see, there is an ID beside each symptom. Those are HPO term IDs, as found in the Human Phenotype Ontology [database](https://hpo.jax.org/app/).
+
+### Annotate candidate genes with HPO terms
+
+```{r}
+sample_HPO= c("HP:0002376","HP:0001251", "HP:0000602","HP:0000505")
+
+sample_HPO
+```
+
+#### Load gene to HPO ID file from HPO database
+
+The Human Phenotype Ontology gives access to a very useful file, showing the link between symptoms and genes. This file is updated regularly so we recommend to **download the latest version** whenever possible.
+
+You can download this file [here](https://hpo.jax.org/app/data/annotations "Link for downloading Genes to phenotype and other classifications of HPOA").
+
+```{r}
+# Get the file URL https://hpo.jax.org/app/data/annotations. The file has to be manually downloaded
+
+
+# Read the file
+gene_hpo <-fread("./phenotype_to_genes.txt", skip=1)
+
+# Select only the columns of interest (Gene and HPO term)
+gene_hpo <- gene_hpo[, c(4, 1)]
+colnames(gene_hpo) <- c("Gene", "Term")
+
+# Look at the results
+head(gene_hpo)
+```
+
+#### Get a subset of genes that could match the syptoms
+
+Now that we have downloaded that file, we want to keep only the genes that are phenotypically relevant to the case.
+
+1.  Filter for HPO terms corresponding to the case
+
+2.  Obtain the Ensembl IDs for the genes that are associated to those HPO terms
+
+```{r}
+genes_hpo_case=gene_hpo %>% 
+  filter(Term %in% sample_HPO) %>%
+  left_join(grch37, by=c("Gene"="symbol"))
+genes_hpo_case = genes_hpo_case %>% select(ensgene) %>% unique %>% unlist
+
+head(genes_hpo_case)
+length(genes_hpo_case)
+```
+
+#### Subset the list of genes to outlier candidates
+
+Here the assumption is that if there is an expression perturbation on the causal gene, this gene is somehow linked to some of the symptoms of the patient.\
+So we want to **filter** the list of genes somehow linked to the patients symptoms (listed in `genes_hpo_case`) for the one obtained as candidates in previous work.
+
+```{r}
+# Filter outlier genes for genes linked to the phenotype.
+candidate_genes.hpo=candidate_genes %>% filter(ensgene %in% genes_hpo_case)
+
+# Get the number of genes left
+cat("The number of outlier genes left after filtering associated with the disease:")
+length(candidate_genes.hpo$ensgene)
+
+# Take a look at the results
+candidate_genes.hpo
+```
+
+### Annotate with variant information
+
+We can go further and annotate our candidate with the variant information for the case.
+
+To do so, we need to transform the candidate gene list into the right format so that we can use the genes when reading in the [VCF](https://www.internationalgenome.org/wiki/Analysis/Variant%20Call%20Format/vcf-variant-call-format-version-40/) file in R.
+
+#### Build a GRanges object with the genes obtain in previous steps
+
+We use R packages that have been developped to handle and filter VCF files. Here, we want to upload only the part of the VCF file that is in regions of interest (i.e., our candidate genes). We can do this by giving as an input an object of type [GRanges](https://web.mit.edu/~r/current/arch/i386_linux26/lib/R/library/GenomicRanges/html/GRanges-class.html).
+
+The next steps are transforming our list of candidate genes to the right format so that we can proceed with the analysis.
+
+1.  Change the start and end position to include potential regulatory regions (+/- 1kb here). Note that you can customize this distance or use the gene coordinates.
+
+```{r}
+# Extending the start/end coordinates to 1kb around the gene of interest 
+candidate_genes=candidate_genes.hpo %>% 
+        mutate(new_start=pmin(start,end)-1e3, new_end=pmax(start,end)+1e3)
+
+# Take a look at the results
+head(candidate_genes)
+```
+
+2.  Transform data frame into GRanges object
+
+```{r}
+# Create a GRanges Object
+candidate_genes.gr=makeGRangesFromDataFrame(
+        candidate_genes, ignore.strand=TRUE,
+        start.field="new_start",end.field="new_end")
+
+# Add gene names to GRanges object
+names(candidate_genes.gr)=candidate_genes$ensgene
+
+candidate_genes.gr
+```
+
+#### Load a VCF file
+
+```{r}
+vcfFile <- "./variants/1000G_subset_exome.vep.vcf.gz"
+# index the VCF file
+indexVcf(vcfFile)
+
+# Create a reference
+vcfFile <- TabixFile(vcfFile)
+
+vcfFile
+```
+
+#### Read in the VCF file for the sample of interest
+
+For demo purposes we can look at sample of interest and the overlapping genes of interest that consists or may consist the variants
+
+```{r}
+params = ScanVcfParam(samples = "NA11918", which = candidate_genes.gr)
+
+# read the vcf file filter the data using the parameter file created above.
+vcf_rng <- readVcf(vcfFile, "hg19", params)
+head(rowRanges(vcf_rng),3)
+```
+
+#### Filter for heterozygous or homozygous Alt and genes of interest
+
+In genomics and sequencing, the term "ALT" typically refers to alternate contigs or alternate haplotypes. A contig is a contiguous sequence of DNA that has been assembled from fragments of sequenced DNA. Alternate contigs represent different versions of a particular region of the genome that may exist in a population or individual. Haplotypes are sets of alleles, or alternative forms of a gene, that are inherited together on a single chromosome. Alternate haplotypes represent different combinations of alleles that may exist in a population or individual.
+
+-   **ALT haplotypes in population genetics:** In population genetics, ALT haplotypes are used to study the genetic diversity of a population. By comparing the haplotypes of different individuals, researchers can identify common and rare variants and track the spread of mutations through a population.
+
+-   **ALT alleles in clinical genetics:** In clinical genetics, ALT alleles are used to identify individuals who may be at risk of genetic disorders. For example, some genetic disorders are caused by the presence of a particular combination of ALT alleles.
+
+```{r}
+candidate_genes
+
+# Create a filter on variants hetero or homozyg alt
+Hetfilt <- FilterRules(list(HetorHomAlt = 
+        function(x) geno(x)$GT %in% c("0|1", "1|1", "1|0")))
+
+# create a filter to keep only candidate gene annotations
+GeneFilt <- VcfVepRules(exprs = list(Cand_genes = 
+        bquote(SYMBOL %in% .(candidate_genes$symbol) )))
+# Combine filters
+combinedPreFilters <- VcfFilterRules(Hetfilt, GeneFilt)
+
+# apply them on the vcf
+vcf_het_cand <- subsetByFilter(vcf_rng, combinedPreFilters)
+
+rowRanges(vcf_het_cand)
+```
+
+#### Consequence field extraction
+
+In order to see potential features we can filter on lets grab the consequence field of the VCF.
+
+```{r}
+# Parse the consequence field of the VCF
+csq <- parseCSQToGRanges(x=vcf_het_cand, VCFRowID = rownames(vcf_het_cand))
+csq[, c("Consequence", "SYMBOL", "BIOTYPE", "gnomAD_AF", "CADD_PHRED")]
+```
+
+#### Define a set of filters
+
+You can custom create a set of filters that you want to apply on your data. These can be Transcription Start Site (TSS), allele frequency, CADD score, Variant Effect Prediction consequences and so forth.
+
+``` html
+<span style="color:red"> 
+Alex What sort of filters would be ideal for NewGenia's Pipeline? 
+</span>
+```
+
+```{r}
+# Filter on distance to the gene
+vepDistFilter <- VcfVepRules(exprs=list(Distance=expression(DISTANCE <= 1000)))
+
+# Filter on allele frequency
+# Here we allow NAs because some variants are uniq to the individual and hence
+# not listed in any public database (eg. gnomAD)
+vepMAFFilter<- VcfVepRules(exprs = list(MAF = 
+        expression(as.numeric(gnomAD_AF) <= 0.01 || gnomAD_AF == "NA")))
+
+# Filter on CADD score
+vepCADDFilter <- VcfVepRules(exprs = list(CADD=expression(CADD_PHRED >= 20)))
+
+# Filter on consequences
+highImpactVariant<-VcfVepRules(exprs=list(BigImpact=
+        expression(grepl(x=Consequence, pattern=paste(collapse="|", c(
+                "splice_acceptor_variant", "splice_donor_variant", 
+                "stop_gained", "stop_lost","frameshift_variant"))))))
+
+regulatoryVariant<-VcfVepRules(exprs=list(RegVar=
+        expression(grepl(x=Consequence, pattern=paste(collapse="|", c(
+                "5_prime_UTR_variant", "3_prime_UTR_variant", "intron_variant",
+                "NMD_transcript_variant", "upstream_gene_variant", 
+                "downstream_gene_variant"))))))
+
+combinedFilters <- VcfFilterRules(
+  vepDistFilter,
+  vepMAFFilter,
+  vepCADDFilter, 
+  highImpactVariant,
+  regulatoryVariant)
+```
+
+```{r}
+active(combinedFilters)
+```
+
+```{r}
+active(combinedFilters)["BigImpact"] <- FALSE
+active(combinedFilters)["RegVar"] <- FALSE
+active(combinedFilters)["Distance"] <- FALSE
+active(combinedFilters)["CADD"] <- FALSE
+
+active(combinedFilters)["MAF"] <- TRUE
+
+active(combinedFilters)
+```
+
+```{r}
+# subset VCF with active filters
+vcf_filt <- subsetByFilter(vcf_het_cand, combinedFilters)
+
+csq_filt <- ensemblVEP::parseCSQToGRanges(x = vcf_filt)
+
+unique(csq_filt[,c("Consequence", "SYMBOL", "BIOTYPE", "gnomAD_AF","CADD_PHRED")])
+```
+
+```{r}
+# Look at number of variants left for each set of filters
+summary(evalSeparately(expr=combinedFilters, envir=vcf_het_cand))
+
+```
